@@ -1,0 +1,30 @@
+PRELIMINARY WALK-FORWARD VALIDATION — SUPPLIED FINLAND DATA
+
+Purpose
+This is a preliminary diagnostic check, not a claim of universal performance.
+Each evaluated historical fixture was predicted using only matches available before that fixture's kickoff.
+
+2025 evaluable matches: 386
+Default v2 ensemble (60% Poisson/Dixon-Coles, 20% Elo, 15% Recent Form, 5% Attack-Defence):
+- 1X2 top-pick accuracy: 59.8%
+- Multiclass log loss: 0.914
+- Brier score: 0.539
+
+2026 evaluable matches: 238
+Default v2 ensemble:
+- 1X2 top-pick accuracy: 56.3%
+- Multiclass log loss: 0.976
+- Brier score: 0.581
+
+For comparison on the same 2026 evaluable set, the previous v1 ensemble
+(50% Poisson, 20% Elo, 20% Recent Form, 10% Attack-Defence) produced:
+- 1X2 top-pick accuracy: 55.0%
+- Multiclass log loss: 0.978
+- Brier score: 0.582
+
+The standalone Attack-Defence logistic model was materially weaker than the other components on the 2026 sample,
+so its default ensemble influence was reduced from 10% to 5% rather than allowing it to dominate the final probability.
+
+Important
+These figures are competition/sample specific. A stronger generic predictor should include an automated Backtest / Calibration tab
+that learns ensemble weights per competition and checks probability calibration using held-out historical fixtures.
