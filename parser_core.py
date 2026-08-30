@@ -41,16 +41,30 @@ def _parse_float_pair(text: str, label: str, percent: bool = False) -> tuple[flo
 
 
 def _competition_from_prefix(prefix: str) -> tuple[str, str]:
+    # Standard FootyStats pages normally include "Country / Competition Past H2H".
     candidates = re.findall(
         r"([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]{1,60})\s*/\s*([A-Za-z0-9À-ÿ][A-Za-z0-9À-ÿ .&'()-]{1,80})\s+Past H2H",
         prefix,
         re.IGNORECASE,
     )
-    if not candidates:
-        return "", ""
-    country, competition = candidates[-1]
-    country = re.sub(r".*?Dark\s+", "", country, flags=re.IGNORECASE).strip()
-    return country.strip(), competition.strip()
+    if candidates:
+        country, competition = candidates[-1]
+        country = re.sub(r".*?Dark\s+", "", country, flags=re.IGNORECASE).strip()
+        return country.strip(), competition.strip()
+
+    # Some friendly/cup pages omit the "Past H2H" token. In those cases the
+    # country/competition pair is still immediately before the fixture date.
+    tail = prefix[-600:]
+    fallback = re.findall(
+        r"Dark\s+([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ .'-]{1,60})\s*/\s*"
+        r"([A-Za-z0-9À-ÿ][A-Za-z0-9À-ÿ .&'()-]{1,80})\s*$",
+        tail,
+        re.IGNORECASE,
+    )
+    if fallback:
+        country, competition = fallback[-1]
+        return country.strip(), competition.strip()
+    return "", ""
 
 
 def classify_match(competition: str) -> tuple[str, float]:
@@ -174,10 +188,12 @@ def detect_focus_team(matches: pd.DataFrame) -> str:
     return counts.most_common(1)[0][0] if counts else ""
 
 
-def to_team_perspective(matches: pd.DataFrame, team: Optional[str] = None, max_matches: int = 5) -> pd.DataFrame:
+def to_team_perspective(matches: pd.DataFrame, team: Optional[str] = None, max_matches: int = 10) -> pd.DataFrame:
+    """Return the most recent matches involving the focus team, capped at 10 by default."""
     if matches.empty:
         return pd.DataFrame()
     team = team or detect_focus_team(matches)
+    max_matches = max(1, min(int(max_matches), 10))
     filt = matches[(matches.home_team == team) | (matches.away_team == team)].copy()
     filt = filt.sort_values("date", ascending=False).head(max_matches)
     rows = []
