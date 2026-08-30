@@ -11,10 +11,22 @@ import pandas as pd
 
 WEEKDAYS = r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)"
 MONTHS = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+MONTH_TO_NUM = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
 HEADER_RE = re.compile(
     rf"(?P<date>{WEEKDAYS}\s+{MONTHS}\s+\d{{1,2}},\s+\d{{4}})\s*-\s*"
     rf"(?P<time>\d{{1,2}}:\d{{2}}(?:am|pm)?)\s*\([^)]*?time\)\s*"
     rf"(?P<home>.+?)\s+vs\s+(?P<away>.+?)\s+Stats,\s*H2H\s*&\s*xG",
+    re.IGNORECASE,
+)
+FINAL_SCORE_RE = re.compile(
+    rf"Final Results\s*(?:"
+    rf"(?P<num_h>\d+)\s*-\s*(?P<num_a>\d+)"
+    rf"|(?P<day>\d+)\s*-\s*(?P<month>{MONTHS})\b"
+    rf"|(?P<month_zero>{MONTHS})\s*-\s*(?P<zero>0{{1,2}})\b"
+    rf")",
     re.IGNORECASE,
 )
 
@@ -38,6 +50,38 @@ def _parse_float_pair(text: str, label: str, percent: bool = False) -> tuple[flo
         return float(v)
 
     return conv(m.group(1)), conv(m.group(2))
+
+
+def _parse_final_score(segment: str) -> Optional[tuple[int, int, int]]:
+    """Return home goals, away goals and regex end-position for Final Results.
+
+    Besides ordinary ``2 - 1`` scores, this repairs a common spreadsheet/Excel
+    conversion seen in copied FootyStats text. Excel may interpret a football
+    score as a month/day and render it as a date-like token. For example:
+
+    - original 1-2 -> ``2-Jan`` (January 2)
+    - original 2-1 -> ``1-Feb`` (February 1)
+    - original 1-3 -> ``3-Jan`` (January 3)
+    - original 3-3 -> ``3-Mar`` (March 3)
+    - original 2-0 -> ``Feb-00``
+
+    In the day-month form, the month therefore represents the HOME score and
+    the leading number represents the AWAY score.
+    """
+    m = FINAL_SCORE_RE.search(segment)
+    if not m:
+        return None
+
+    if m.group("num_h") is not None:
+        return int(m.group("num_h")), int(m.group("num_a")), m.end()
+
+    if m.group("month") is not None:
+        home_goals = MONTH_TO_NUM[m.group("month").lower()]
+        away_goals = int(m.group("day"))
+        return home_goals, away_goals, m.end()
+
+    home_goals = MONTH_TO_NUM[m.group("month_zero").lower()]
+    return home_goals, 0, m.end()
 
 
 def _competition_from_prefix(prefix: str) -> tuple[str, str]:
@@ -122,6 +166,7 @@ def parse_match_pages(raw_text: str) -> pd.DataFrame:
 
     Only the fixture header, Final Results and the first post-match Data block are used.
     Prediction Stats, Current Form and Odds Market sections are deliberately ignored.
+    Final scores that have been converted to Excel-style date tokens are repaired.
     """
     text = _space(raw_text)
     headers = list(HEADER_RE.finditer(text))
@@ -133,15 +178,14 @@ def parse_match_pages(raw_text: str) -> pd.DataFrame:
         segment = text[h.end():end]
         prefix = text[max(0, start - 2000):start]
 
-        score_m = re.search(r"Final Results\s*(\d+)\s*-\s*(\d+)", segment, re.IGNORECASE)
-        if not score_m:
+        score = _parse_final_score(segment)
+        if score is None:
             continue
-        hg, ag = int(score_m.group(1)), int(score_m.group(2))
+        hg, ag, final_pos = score
 
         ht_m = re.search(r"HT\s*\(?\s*(\d+)\s*-\s*(\d+)\s*\)?", segment, re.IGNORECASE)
         hth, hta = (float(ht_m.group(1)), float(ht_m.group(2))) if ht_m else (np.nan, np.nan)
 
-        final_pos = score_m.end()
         h2h_pos = segment.find("Head to Head Statistics", final_pos)
         stats_scope = segment[final_pos:h2h_pos if h2h_pos >= 0 else len(segment)]
         poss_pos = stats_scope.find("Possession")
