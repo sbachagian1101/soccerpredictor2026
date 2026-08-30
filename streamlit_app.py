@@ -40,7 +40,7 @@ st.markdown(
 <div class="hero">
   <span class="badge">FORM-ONLY · NO MARKET ODDS</span>
   <h1>⚽ Soccer Prediction Lab 2026</h1>
-  <p>Paste each team's last five FootyStats match pages. The app parses the actual post-match data, weights match quality and recency, then runs a multi-model ensemble.</p>
+  <p>Paste up to 10 recent FootyStats match pages for each team. The app parses the actual post-match data, weights match quality and recency, then runs a multi-model ensemble.</p>
 </div>
 """,
     unsafe_allow_html=True,
@@ -62,23 +62,23 @@ input_tab, parsed_tab, analytics_tab, prediction_tab, models_tab = st.tabs([
 ])
 
 with input_tab:
-    st.subheader("Paste the last five matches for each team")
-    st.caption("For best results, paste the complete copied FootyStats text for each historical match page into the relevant box. Five pages may be pasted together.")
+    st.subheader("Paste up to 10 matches for each team")
+    st.caption("Paste the complete copied FootyStats text for each historical match page into the relevant box. You may paste between 1 and 10 pages together; if more than 10 valid matches are found, the app keeps the 10 most recent for that team.")
     c1, c2 = st.columns(2)
     with c1:
         home_text = st.text_area(
-            "Home team — last 5 matches",
+            "Home team — up to 10 matches",
             value=st.session_state.get("raw_home", ""),
-            height=430,
-            placeholder="Paste the home team's five FootyStats match pages here…",
+            height=500,
+            placeholder="Paste up to 10 FootyStats match pages for the home team here…",
             key="home_text_input",
         )
     with c2:
         away_text = st.text_area(
-            "Away team — last 5 matches",
+            "Away team — up to 10 matches",
             value=st.session_state.get("raw_away", ""),
-            height=430,
-            placeholder="Paste the away team's five FootyStats match pages here…",
+            height=500,
+            placeholder="Paste up to 10 FootyStats match pages for the away team here…",
             key="away_text_input",
         )
 
@@ -90,10 +90,10 @@ with input_tab:
             raw_a = parse_match_pages(away_text)
             team_h = detect_focus_team(raw_h)
             team_a = detect_focus_team(raw_a)
-            hdf = to_team_perspective(raw_h, team_h, max_matches=5)
-            adf = to_team_perspective(raw_a, team_a, max_matches=5)
+            hdf = to_team_perspective(raw_h, team_h, max_matches=10)
+            adf = to_team_perspective(raw_a, team_a, max_matches=10)
             if hdf.empty or adf.empty:
-                st.error("I could not identify completed 'Final Results' + 'Data' blocks in one or both text boxes.")
+                st.error("I could not identify completed 'Final Results' blocks in one or both text boxes.")
             else:
                 st.session_state["raw_home"] = home_text
                 st.session_state["raw_away"] = away_text
@@ -105,7 +105,7 @@ with input_tab:
                 st.success(f"Parsed {len(hdf)} matches for {team_h} and {len(adf)} matches for {team_a}. Open Parsed Data to review them.")
 
     st.markdown("#### What is extracted")
-    st.write("Score, xG/xGA, shots, shots on target, possession, corners, cards, fouls, offsides, venue, competition and match date. The team-perspective table also calculates W/D/L and later receives observation weights.")
+    st.write("Score, xG/xGA, shots, shots on target, possession, corners, cards, fouls, offsides, venue, competition and match date. The team-perspective table also calculates W/D/L and later receives observation weights. Missing post-match fields are retained as missing values and automatically reduce that match's data-completeness weight.")
 
 
 def editor_table(df: pd.DataFrame, key: str):
@@ -141,7 +141,7 @@ with parsed_tab:
         home_team = st.session_state["home_team"]
         away_team = st.session_state["away_team"]
         st.subheader(f"{home_team} vs {away_team} — parser review")
-        st.caption("Only Use, match type/importance and opponent quality are editable. Correct or exclude a questionable match before predicting.")
+        st.caption("Up to 10 recent matches per team are retained. Only Use, match type/importance and opponent quality are editable. Correct or exclude a questionable match before predicting.")
 
         l, r = st.columns(2)
         with l:
@@ -212,7 +212,7 @@ with analytics_tab:
             fig.update_layout(height=430, polar=dict(radialaxis=dict(visible=True, range=[0,100])), margin=dict(l=25,r=25,t=35,b=25), legend=dict(orientation='h'))
             st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("#### Five-match xG trend")
+        st.markdown("#### Parsed-match xG trend (up to 10 matches)")
         fig = go.Figure()
         for label, df in [(res['home_team'], st.session_state['weighted_home']), (res['away_team'], st.session_state['weighted_away'])]:
             d = df.sort_values('date')
