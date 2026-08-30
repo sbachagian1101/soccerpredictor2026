@@ -1,222 +1,301 @@
-import io
+from __future__ import annotations
+
+from datetime import date
+
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 
-from model_core import (
-    all_teams, build_match_explanation, combine_uploaded_frames, data_diagnostics, find_upcoming_fixtures,
-    predict_fixture, recent_matches_table, team_summary
+from parser_core import apply_observation_weights, detect_focus_team, parse_match_pages, to_team_perspective
+from prediction_engine import build_prediction, feature_comparison, score_matrix_dataframe
+
+st.set_page_config(page_title="Soccer Prediction Lab 2026", page_icon="⚽", layout="wide")
+
+st.markdown(
+    """
+<style>
+:root { --card:#111827; --muted:#94a3b8; --green:#22c55e; --amber:#f59e0b; --blue:#38bdf8; }
+.stApp { background: radial-gradient(circle at 15% 0%, #172554 0%, #0b1220 24%, #070b12 60%); }
+.block-container { padding-top: 1.2rem; max-width: 1500px; }
+.hero { padding: 1.25rem 1.4rem; border:1px solid rgba(148,163,184,.20); border-radius:22px; background:linear-gradient(135deg,rgba(30,64,175,.35),rgba(15,23,42,.88)); margin-bottom:1rem; }
+.hero h1 { margin:0; font-size:2.25rem; }
+.hero p { margin:.35rem 0 0; color:#cbd5e1; }
+.pred-card { min-height:142px; padding:1rem; border-radius:20px; border:1px solid rgba(148,163,184,.18); background:linear-gradient(160deg,rgba(30,41,59,.92),rgba(15,23,42,.82)); text-align:center; }
+.pred-card.best { border:1px solid rgba(34,197,94,.65); box-shadow:0 0 28px rgba(34,197,94,.10); }
+.pred-label { color:#94a3b8; font-size:.85rem; text-transform:uppercase; letter-spacing:.08em; }
+.pred-value { font-size:2.25rem; font-weight:800; margin:.25rem 0; }
+.pred-name { color:#e2e8f0; font-weight:600; }
+.market-card { padding:1rem 1.1rem; border-radius:18px; border:1px solid rgba(148,163,184,.16); background:rgba(15,23,42,.72); }
+.badge { display:inline-block; padding:.24rem .55rem; border-radius:999px; background:rgba(56,189,248,.12); color:#7dd3fc; font-size:.78rem; }
+.small-note { color:#94a3b8; font-size:.88rem; }
+div[data-testid="stMetric"] { background:rgba(15,23,42,.66); border:1px solid rgba(148,163,184,.16); padding:.8rem; border-radius:16px; }
+</style>
+""",
+    unsafe_allow_html=True,
 )
 
-st.set_page_config(page_title='Soccer Predictor', page_icon='⚽', layout='wide')
-st.title('⚽ Soccer Predictor')
-st.caption('Upload match-history CSV files, choose Home vs Away, and calculate multi-model 1X2 probabilities.')
+st.markdown(
+    """
+<div class="hero">
+  <span class="badge">FORM-ONLY · NO MARKET ODDS</span>
+  <h1>⚽ Soccer Prediction Lab 2026</h1>
+  <p>Paste each team's last five FootyStats match pages. The app parses the actual post-match data, weights match quality and recency, then runs a multi-model ensemble.</p>
+</div>
+""",
+    unsafe_allow_html=True,
+)
 
-uploaded = st.sidebar.file_uploader('Upload CSV file(s)', type=['csv'], accept_multiple_files=True)
-st.sidebar.caption('You can upload multiple seasons. The model only uses completed matches available before the selected fixture/cutoff.')
+with st.sidebar:
+    st.header("Match setup")
+    upcoming_date = st.date_input("Upcoming match date", value=date.today())
+    half_life = st.slider("Recency half-life (days)", 20, 120, 45, 5)
+    st.caption("A 45-day half-life means a match 45 days older receives half the recency weight of a match played today.")
+    st.divider()
+    st.markdown("**Weight formula**")
+    st.caption("Recency × venue relevance × data completeness × competition importance × opponent-quality adjustment.")
+    st.markdown("**Leakage protection**")
+    st.caption("Odds Market, Prediction Stats, Who Will Win and duplicated Current Form sections are not used.")
 
-@st.cache_data(show_spinner=False)
-def parse_files(payload):
-    named=[]
-    for name, data in payload:
-        named.append((name, pd.read_csv(io.BytesIO(data))))
-    return combine_uploaded_frames(named)
-
-if not uploaded:
-    st.info('Upload one or more soccer match-history CSV files to begin.')
-    st.stop()
-
-try:
-    df = parse_files([(f.name, f.getvalue()) for f in uploaded])
-except Exception as e:
-    st.error(f'CSV parsing error: {e}')
-    st.stop()
-
-d = data_diagnostics(df)
-m1,m2,m3,m4 = st.columns(4)
-m1.metric('Rows parsed', d['rows'])
-m2.metric('Completed matches', d['completed'])
-m3.metric('Teams detected', d['teams'])
-m4.metric('Upcoming fixtures', d['upcoming'])
-st.caption(f"Optional data detected — xG: {'Yes' if d['xg_available'] else 'No'} · shots on target: {'Yes' if d['shots_available'] else 'No'}")
-
-teams = all_teams(df)
-fixtures = find_upcoming_fixtures(df)
-fixture_options = ['Manual team selection']
-fixture_lookup = {}
-for _, r in fixtures.iterrows():
-    label = f"{r['date_GMT']} | {r['home_team_name']} vs {r['away_team_name']}"
-    fixture_options.append(label)
-    fixture_lookup[label] = (r['home_team_name'], r['away_team_name'], float(r['timestamp']))
-
-st.subheader('Select match')
-fixture_choice = st.selectbox('Upcoming fixture (optional — auto-fills teams)', fixture_options)
-
-if fixture_choice in fixture_lookup:
-    default_home, default_away, fixture_ts = fixture_lookup[fixture_choice]
-else:
-    default_home = teams[0] if teams else ''
-    default_away = teams[1] if len(teams) > 1 else default_home
-    fixture_ts = None
-
-left, right = st.columns(2)
-with left:
-    home_idx = teams.index(default_home) if default_home in teams else 0
-    home = st.selectbox('Home team', teams, index=home_idx, key=f'home_{fixture_choice}')
-with right:
-    away_idx = teams.index(default_away) if default_away in teams else min(1, len(teams)-1)
-    away = st.selectbox('Away team', teams, index=away_idx, key=f'away_{fixture_choice}')
-
-# Only preserve fixture timestamp if the user kept the auto-filled pairing.
-selected_ts = fixture_ts if fixture_choice in fixture_lookup and (home, away) == fixture_lookup[fixture_choice][:2] else None
-
-if st.button('Analyse match', type='primary', use_container_width=True):
-    st.session_state['run_prediction'] = (home, away, selected_ts)
-
-if 'run_prediction' not in st.session_state:
-    st.stop()
-
-home, away, selected_ts = st.session_state['run_prediction']
-try:
-    r, training = predict_fixture(df, home, away, selected_ts)
-except Exception as e:
-    st.error(str(e))
-    st.stop()
-
-pick = max([(r.home_team,r.p_home),('Draw',r.p_draw),(r.away_team,r.p_away)], key=lambda x:x[1])
-quality = 'High' if r.data_quality >= .75 else 'Moderate' if r.data_quality >= .50 else 'Limited'
-
-st.divider()
-st.subheader(f'{r.home_team} vs {r.away_team}')
-st.caption(f'{r.kickoff} · {r.training_matches} historical matches · {r.group_size}-team comparison group · data quality {quality} ({r.data_quality*100:.0f}%)')
-
-c1,c2,c3 = st.columns(3)
-c1.metric(f'1 — {r.home_team}', f'{r.p_home*100:.1f}%')
-c2.metric('X — Draw', f'{r.p_draw*100:.1f}%')
-c3.metric(f'2 — {r.away_team}', f'{r.p_away*100:.1f}%')
-st.success(f'Prediction: **{pick[0]}** ({pick[1]*100:.1f}%) · Expected goals: **{r.lambda_home:.2f} – {r.lambda_away:.2f}**')
-
-explain_tab, pred_tab, strength_tab, form_tab, score_tab, method_tab = st.tabs([
-    'Explanation','Model breakdown','Strength / Weakness','Recent form','Scorelines','Method'
+input_tab, parsed_tab, analytics_tab, prediction_tab, models_tab = st.tabs([
+    "1 · Match Input", "2 · Parsed Data", "3 · Team Analytics", "4 · Prediction", "5 · Model Breakdown"
 ])
 
-with explain_tab:
-    st.markdown('### Why the model produced this prediction')
-    for i, line in enumerate(build_match_explanation(r, training), start=1):
-        if i == 1:
-            st.info(line)
-        elif line.startswith('Uncertainty:') or line.startswith('Validation status:'):
-            st.warning(line)
+with input_tab:
+    st.subheader("Paste the last five matches for each team")
+    st.caption("For best results, paste the complete copied FootyStats text for each historical match page into the relevant box. Five pages may be pasted together.")
+    c1, c2 = st.columns(2)
+    with c1:
+        home_text = st.text_area(
+            "Home team — last 5 matches",
+            value=st.session_state.get("raw_home", ""),
+            height=430,
+            placeholder="Paste the home team's five FootyStats match pages here…",
+            key="home_text_input",
+        )
+    with c2:
+        away_text = st.text_area(
+            "Away team — last 5 matches",
+            value=st.session_state.get("raw_away", ""),
+            height=430,
+            placeholder="Paste the away team's five FootyStats match pages here…",
+            key="away_text_input",
+        )
+
+    if st.button("🔎 Parse Match Data", type="primary", use_container_width=True):
+        if not home_text.strip() or not away_text.strip():
+            st.error("Paste both teams' historical match text before parsing.")
         else:
-            st.write('• ' + line)
+            raw_h = parse_match_pages(home_text)
+            raw_a = parse_match_pages(away_text)
+            team_h = detect_focus_team(raw_h)
+            team_a = detect_focus_team(raw_a)
+            hdf = to_team_perspective(raw_h, team_h, max_matches=5)
+            adf = to_team_perspective(raw_a, team_a, max_matches=5)
+            if hdf.empty or adf.empty:
+                st.error("I could not identify completed 'Final Results' + 'Data' blocks in one or both text boxes.")
+            else:
+                st.session_state["raw_home"] = home_text
+                st.session_state["raw_away"] = away_text
+                st.session_state["home_team"] = team_h
+                st.session_state["away_team"] = team_a
+                st.session_state["home_df"] = hdf
+                st.session_state["away_df"] = adf
+                st.session_state.pop("prediction", None)
+                st.success(f"Parsed {len(hdf)} matches for {team_h} and {len(adf)} matches for {team_a}. Open Parsed Data to review them.")
+
+    st.markdown("#### What is extracted")
+    st.write("Score, xG/xGA, shots, shots on target, possession, corners, cards, fouls, offsides, venue, competition and match date. The team-perspective table also calculates W/D/L and later receives observation weights.")
 
 
-with pred_tab:
-    comp = pd.DataFrame({
-        'Model':['Poisson / Dixon-Coles','Elo','Recent form','Attack-Defence','Final ensemble'],
-        f'1 — {r.home_team}':[r.poisson_probs[0],r.elo_probs[0],r.form_probs[0],r.strength_probs[0],r.p_home],
-        'X — Draw':[r.poisson_probs[1],r.elo_probs[1],r.form_probs[1],r.strength_probs[1],r.p_draw],
-        f'2 — {r.away_team}':[r.poisson_probs[2],r.elo_probs[2],r.form_probs[2],r.strength_probs[2],r.p_away],
-    })
-    for c in comp.columns[1:]:
-        comp[c] = (comp[c]*100).round(2).astype(str) + '%'
-    st.dataframe(comp, use_container_width=True, hide_index=True)
-    st.markdown('**Ensemble:** ' + ' · '.join(f'{k} {v*100:.0f}%' for k,v in r.model_weights.items()))
-
-with strength_tab:
-    strength = pd.DataFrame([
-        {
-            'Team':r.home_team,'Role':'Home',
-            'Attack Index':round(r.home_attack,1),'Defence Index':round(r.home_defense,1),
-            'Attacking Strength':round(r.home_attack_strength,1),'Attacking Weakness':round(r.home_attack_weakness,1),
-            'Defensive Strength':round(r.home_defense_strength,1),'Defensive Weakness':round(r.home_defense_weakness,1),
-            'Defensive Weakness Index':round(r.home_def_weakness,1)
+def editor_table(df: pd.DataFrame, key: str):
+    show_cols = [
+        "include", "date", "venue", "opponent", "competition", "match_type", "importance", "opponent_quality",
+        "result", "gf", "ga", "xg", "xga", "shots_for", "shots_against", "sot_for", "sot_against",
+        "possession", "corners_for", "corners_against", "parse_quality",
+    ]
+    work = df[show_cols].copy()
+    return st.data_editor(
+        work,
+        use_container_width=True,
+        hide_index=True,
+        key=key,
+        disabled=[
+            "date", "venue", "opponent", "competition", "result", "gf", "ga", "xg", "xga", "shots_for",
+            "shots_against", "sot_for", "sot_against", "possession", "corners_for", "corners_against", "parse_quality",
+        ],
+        column_config={
+            "include": st.column_config.CheckboxColumn("Use"),
+            "importance": st.column_config.NumberColumn("Importance", min_value=0.2, max_value=1.4, step=0.05, format="%.2f"),
+            "opponent_quality": st.column_config.NumberColumn("Opponent quality", min_value=0.7, max_value=1.3, step=0.05, format="%.2f"),
+            "parse_quality": st.column_config.ProgressColumn("Parse quality", min_value=0.0, max_value=1.0, format="%.0%%"),
+            "date": st.column_config.DateColumn("Date"),
         },
-        {
-            'Team':r.away_team,'Role':'Away',
-            'Attack Index':round(r.away_attack,1),'Defence Index':round(r.away_defense,1),
-            'Attacking Strength':round(r.away_attack_strength,1),'Attacking Weakness':round(r.away_attack_weakness,1),
-            'Defensive Strength':round(r.away_defense_strength,1),'Defensive Weakness':round(r.away_defense_weakness,1),
-            'Defensive Weakness Index':round(r.away_def_weakness,1)
-        },
-    ])
-    st.dataframe(strength, use_container_width=True, hide_index=True)
-    st.caption('Indices are centred on 100. Attack/Defence Index >100 is better. Strength and weakness are separate weighted component-deviation points versus the comparison-group average, so a team can show both strengths and weaknesses at the same time.')
+    )
 
-    st.markdown('#### Component ratings')
-    components = pd.DataFrame([
-        {'Team':r.home_team,'Side':'Attack',**{k:(round(v*100,1) if pd.notna(v) else None) for k,v in r.home_attack_components.items()}},
-        {'Team':r.away_team,'Side':'Attack',**{k:(round(v*100,1) if pd.notna(v) else None) for k,v in r.away_attack_components.items()}},
-        {'Team':r.home_team,'Side':'Defensive vulnerability',**{k:(round(v*100,1) if pd.notna(v) else None) for k,v in r.home_defense_components.items()}},
-        {'Team':r.away_team,'Side':'Defensive vulnerability',**{k:(round(v*100,1) if pd.notna(v) else None) for k,v in r.away_defense_components.items()}},
-    ])
-    st.dataframe(components, use_container_width=True, hide_index=True)
-    st.caption('Component values are league-relative ratios ×100. For attack components, higher is stronger. For defensive-vulnerability components, higher is worse.')
 
-    summary=[]
-    for team, venue in [(r.home_team,'H'),(r.away_team,'A')]:
-        for label,v,n in [('Overall',None,None),('Last 5 overall',None,5),(f'Last 5 {"home" if venue=="H" else "away"}',venue,5)]:
-            summary.append({'Team':team,'Split':label,**team_summary(training,team,venue=v,last_n=n)})
-    st.dataframe(pd.DataFrame(summary), use_container_width=True, hide_index=True)
+with parsed_tab:
+    if "home_df" not in st.session_state or "away_df" not in st.session_state:
+        st.info("Parse both teams on the Match Input tab first.")
+    else:
+        home_team = st.session_state["home_team"]
+        away_team = st.session_state["away_team"]
+        st.subheader(f"{home_team} vs {away_team} — parser review")
+        st.caption("Only Use, match type/importance and opponent quality are editable. Correct or exclude a questionable match before predicting.")
 
-with form_tab:
-    l,rcol = st.columns(2)
-    with l:
-        st.markdown(f'#### {r.home_team} — last 5 overall')
-        st.dataframe(recent_matches_table(training,r.home_team,n=5),use_container_width=True,hide_index=True)
-        st.markdown(f'#### {r.home_team} — last 5 home')
-        st.dataframe(recent_matches_table(training,r.home_team,venue='H',n=5),use_container_width=True,hide_index=True)
-    with rcol:
-        st.markdown(f'#### {r.away_team} — last 5 overall')
-        st.dataframe(recent_matches_table(training,r.away_team,n=5),use_container_width=True,hide_index=True)
-        st.markdown(f'#### {r.away_team} — last 5 away')
-        st.dataframe(recent_matches_table(training,r.away_team,venue='A',n=5),use_container_width=True,hide_index=True)
+        l, r = st.columns(2)
+        with l:
+            st.markdown(f"### 🏠 {home_team}")
+            edited_h = editor_table(st.session_state["home_df"], "editor_home")
+        with r:
+            st.markdown(f"### ✈️ {away_team}")
+            edited_a = editor_table(st.session_state["away_df"], "editor_away")
 
-with score_tab:
-    score_df = pd.DataFrame(r.top_scores,columns=['Score','Probability'])
-    score_df['Probability'] = (score_df['Probability']*100).round(2).astype(str)+'%'
-    st.dataframe(score_df,use_container_width=True,hide_index=True)
+        for edited, base_key in [(edited_h, "home_df"), (edited_a, "away_df")]:
+            base = st.session_state[base_key].copy().reset_index(drop=True)
+            edited = edited.reset_index(drop=True)
+            for c in edited.columns:
+                base[c] = edited[c]
+            st.session_state[base_key] = base
 
-with method_tab:
-    st.markdown('''
-### Data extraction
-The app maps common soccer CSV fields into a standard schema. Required information is match date/timestamp, home team, away team and full-time goals. **xG and shots on target are optional** and improve the attack/defence estimate when present.
+        wh = apply_observation_weights(st.session_state["home_df"], upcoming_date, "Home", half_life)
+        wa = apply_observation_weights(st.session_state["away_df"], upcoming_date, "Away", half_life)
 
-### Attack and defence ratings
-**Attack** = 55% goals scored + 30% xG + 15% shots on target.  
-**Defensive vulnerability** = 55% goals conceded + 30% xGA + 15% opponent shots on target.
+        st.markdown("#### Final observation weights")
+        wc1, wc2 = st.columns(2)
+        cols = ["date", "opponent", "match_type", "days_ago", "recency_weight", "venue_weight", "importance", "opponent_quality", "weight"]
+        with wc1:
+            st.dataframe(wh[cols].style.format({"recency_weight":"{:.3f}","venue_weight":"{:.2f}","importance":"{:.2f}","opponent_quality":"{:.2f}","weight":"{:.3f}"}), use_container_width=True, hide_index=True)
+        with wc2:
+            st.dataframe(wa[cols].style.format({"recency_weight":"{:.3f}","venue_weight":"{:.2f}","importance":"{:.2f}","opponent_quality":"{:.2f}","weight":"{:.3f}"}), use_container_width=True, hide_index=True)
 
-If an optional xG/SOT field is unavailable, its weight is **redistributed across the metrics that are present** rather than pretending the missing value is league-average.
+        if st.button("⚽ PREDICT MATCH", type="primary", use_container_width=True):
+            try:
+                st.session_state["weighted_home"] = wh
+                st.session_state["weighted_away"] = wa
+                st.session_state["prediction"] = build_prediction(wh, wa)
+                st.success("Prediction complete. Open the Prediction tab.")
+            except Exception as exc:
+                st.error(f"Prediction error: {exc}")
 
-Each statistic combines:
-- 30% season/available-history overall
-- 25% home/away split
-- 25% last 5 overall
-- 20% last 5 at the relevant venue
 
-Small samples are shrunk toward competition average.
+with analytics_tab:
+    if "prediction" not in st.session_state:
+        st.info("Parse the data and press PREDICT MATCH first.")
+    else:
+        res = st.session_state["prediction"]
+        h = res["home_features"]; a = res["away_features"]
+        st.subheader("Weighted team analytics")
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric(f"{res['home_team']} Attack", f"{h['attack_strength']:.0f}/100")
+        c2.metric(f"{res['home_team']} Defence", f"{h['defense_strength']:.0f}/100")
+        c3.metric(f"{res['away_team']} Attack", f"{a['attack_strength']:.0f}/100")
+        c4.metric(f"{res['away_team']} Defence", f"{a['defense_strength']:.0f}/100")
 
-### Prediction models
-1. **Poisson / Dixon-Coles** — estimates expected goals and scoreline probabilities.
-2. **Elo** — rates opponent-adjusted team strength and home advantage.
-3. **Recent form** — uses last-5 PPG, goal difference and xG difference.
-4. **Attack-Defence logistic model** — independently compares attacking strength against defensive vulnerability.
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Home attack weakness", f"{h['attack_weakness']:.0f}/100")
+        c2.metric("Home defence weakness", f"{h['defense_weakness']:.0f}/100")
+        c3.metric("Away attack weakness", f"{a['attack_weakness']:.0f}/100")
+        c4.metric("Away defence weakness", f"{a['defense_weakness']:.0f}/100")
 
-The final 1X2 probability blends them at **60% / 20% / 15% / 5%** respectively.
+        left, right = st.columns([1.15, 1])
+        with left:
+            comp = feature_comparison(res)
+            st.dataframe(comp.style.format({res['home_team']:"{:.2f}", res['away_team']:"{:.2f}"}), use_container_width=True, hide_index=True)
+        with right:
+            cats = ["Attack", "Defence", "Chance creation", "Finishing", "Corner pressure", "Form"]
+            hv = [h['attack_strength'], h['defense_strength'], np.clip(50+15*h['xgd'],1,99), np.clip(50+30*h['finishing_delta'],1,99), np.clip(50+7*(h['corners_for']-h['corners_against']),1,99), np.clip(33*h['ppg'],1,99)]
+            av = [a['attack_strength'], a['defense_strength'], np.clip(50+15*a['xgd'],1,99), np.clip(50+30*a['finishing_delta'],1,99), np.clip(50+7*(a['corners_for']-a['corners_against']),1,99), np.clip(33*a['ppg'],1,99)]
+            fig = go.Figure()
+            fig.add_trace(go.Scatterpolar(r=hv+[hv[0]], theta=cats+[cats[0]], fill='toself', name=res['home_team']))
+            fig.add_trace(go.Scatterpolar(r=av+[av[0]], theta=cats+[cats[0]], fill='toself', name=res['away_team']))
+            fig.update_layout(height=430, polar=dict(radialaxis=dict(visible=True, range=[0,100])), margin=dict(l=25,r=25,t=35,b=25), legend=dict(orientation='h'))
+            st.plotly_chart(fig, use_container_width=True)
 
-### Strength / weakness interpretation
-- **Attack Index**: 100 = group average; above 100 means a stronger attack.
-- **Defence Index**: 100 = group average; above 100 means a stronger defence.
-- **Attacking Strength / Weakness**: weighted favourable/unfavourable deviations across the attack components relative to average.
-- **Defensive Strength / Weakness**: weighted favourable/unfavourable deviations across the defensive components relative to average.
+        st.markdown("#### Five-match xG trend")
+        fig = go.Figure()
+        for label, df in [(res['home_team'], st.session_state['weighted_home']), (res['away_team'], st.session_state['weighted_away'])]:
+            d = df.sort_values('date')
+            fig.add_trace(go.Scatter(x=d.date, y=d.xg, mode='lines+markers', name=f'{label} xG'))
+            fig.add_trace(go.Scatter(x=d.date, y=d.xga, mode='lines+markers', name=f'{label} xGA', line=dict(dash='dot')))
+        fig.update_layout(height=360, yaxis_title='Expected goals', margin=dict(l=20,r=20,t=25,b=20), legend=dict(orientation='h'))
+        st.plotly_chart(fig, use_container_width=True)
 
-### Validation status
-This version is a **multi-model analytical model**, but its 55/30/15 feature weights, recency weights and 50/20/20/10 ensemble weights are still fixed expert-chosen values. They have not yet been optimised by walk-forward backtesting. For a genuinely calibrated forecasting model, the next step is to backtest historical fixtures and tune the weights against **log loss, Brier score and 1X2 calibration**, using only information available before each historical kickoff.
 
-### Data leakage protection
-If the selected match is an upcoming fixture contained in the uploaded CSV, only completed matches before its kickoff are used. For a manual pairing, the model uses the latest completed data available.
+with prediction_tab:
+    if "prediction" not in st.session_state:
+        st.info("Your prediction dashboard will appear here after you press PREDICT MATCH on Parsed Data.")
+    else:
+        r = st.session_state["prediction"]
+        probs = {r['home_team']:r['p_home'], 'Draw':r['p_draw'], r['away_team']:r['p_away']}
+        best = max(probs, key=probs.get)
+        st.subheader(f"{r['home_team']}  vs  {r['away_team']}")
+        st.caption(f"Ensemble expected goals: {r['expected_home_goals']:.2f} – {r['expected_away_goals']:.2f} · Confidence {r['confidence']:.0f}/100")
 
-**Bookmaker odds are not used.**
-''')
-    st.markdown('**Model notes**')
-    for note in r.notes:
-        st.write('• ' + note)
+        cols = st.columns(3)
+        cards = [(r['home_team'], '1 · HOME', r['p_home']), ('Draw', 'X · DRAW', r['p_draw']), (r['away_team'], '2 · AWAY', r['p_away'])]
+        for col,(name,label,p) in zip(cols,cards):
+            cls = 'pred-card best' if name == best else 'pred-card'
+            col.markdown(f"<div class='{cls}'><div class='pred-label'>{label}</div><div class='pred-value'>{p*100:.1f}%</div><div class='pred-name'>{name}</div></div>", unsafe_allow_html=True)
+
+        st.success(f"**Primary 1X2 pick: {r['pick']}** · model confidence {r['confidence']:.0f}/100")
+
+        m1,m2,m3,m4 = st.columns(4)
+        m1.markdown(f"<div class='market-card'><div class='pred-label'>BTTS</div><div class='pred-value'>{r['btts_yes']*100:.1f}%</div><div class='pred-name'>YES</div><div class='small-note'>No {r['btts_no']*100:.1f}%</div></div>", unsafe_allow_html=True)
+        m2.markdown(f"<div class='market-card'><div class='pred-label'>TOTAL GOALS 2.5</div><div class='pred-value'>{r['over25']*100:.1f}%</div><div class='pred-name'>OVER 2.5</div><div class='small-note'>Under {r['under25']*100:.1f}%</div></div>", unsafe_allow_html=True)
+        m3.markdown(f"<div class='market-card'><div class='pred-label'>CORNERS 8.5</div><div class='pred-value'>{r['corners']['over85']*100:.1f}%</div><div class='pred-name'>OVER 8.5</div><div class='small-note'>Expected {r['corners']['expected']:.1f}</div></div>", unsafe_allow_html=True)
+        top_score = r['top_scores'][0]
+        m4.markdown(f"<div class='market-card'><div class='pred-label'>TOP SCORE</div><div class='pred-value'>{top_score[0]}</div><div class='pred-name'>{top_score[1]*100:.1f}%</div><div class='small-note'>Distribution ensemble</div></div>", unsafe_allow_html=True)
+
+        st.markdown("### Full-time score probability matrix (%)")
+        sm = score_matrix_dataframe(r, 6)
+        heat = go.Figure(data=go.Heatmap(z=sm.values, x=sm.columns, y=sm.index, text=np.round(sm.values,1), texttemplate='%{text:.1f}', hovertemplate='Home %{y} - Away %{x}: %{z:.2f}%<extra></extra>'))
+        heat.update_layout(height=530, xaxis_title=f"{r['away_team']} goals", yaxis_title=f"{r['home_team']} goals", margin=dict(l=40,r=20,t=20,b=45))
+        st.plotly_chart(heat, use_container_width=True)
+
+        st.markdown("#### Most likely scorelines")
+        ts = pd.DataFrame(r['top_scores'], columns=['Score','Probability'])
+        ts['Probability'] = (ts['Probability']*100).map(lambda v:f'{v:.2f}%')
+        st.dataframe(ts, use_container_width=True, hide_index=True)
+
+
+with models_tab:
+    if "prediction" not in st.session_state:
+        st.info("Run a prediction to see the mathematical model breakdown.")
+    else:
+        r = st.session_state["prediction"]
+        st.subheader("12-model 1X2 ensemble")
+        md = r['models'].copy()
+        md['Home %'] = md['Home']*100; md['Draw %'] = md['Draw']*100; md['Away %'] = md['Away']*100; md['Weight %'] = md['Weight']*100
+        st.dataframe(md[['Model','Family','Home %','Draw %','Away %','Weight %']].style.format({'Home %':'{:.1f}','Draw %':'{:.1f}','Away %':'{:.1f}','Weight %':'{:.1f}'}), use_container_width=True, hide_index=True)
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(name='Home', x=md.Model, y=md['Home %']))
+        fig.add_trace(go.Bar(name='Draw', x=md.Model, y=md['Draw %']))
+        fig.add_trace(go.Bar(name='Away', x=md.Model, y=md['Away %']))
+        fig.update_layout(barmode='group', height=470, yaxis_title='Probability %', xaxis_tickangle=-35, margin=dict(l=20,r=20,t=25,b=145), legend=dict(orientation='h'))
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Corner model breakdown")
+        cb = r['corners']['breakdown'].copy()
+        cb['Over 8.5 %'] = cb.P_Over_8_5*100; cb['Weight %'] = cb.Weight*100
+        st.dataframe(cb[['Model','Over 8.5 %','Expected_Corners','Weight %']].style.format({'Over 8.5 %':'{:.1f}','Expected_Corners':'{:.2f}','Weight %':'{:.1f}'}), use_container_width=True, hide_index=True)
+
+        st.markdown("### Methods used")
+        st.markdown("""
+1. Independent Poisson using recent goals.
+2. xG Poisson.
+3. Attack–defence strength Poisson.
+4. Dixon–Coles low-score correction.
+5. Bivariate Poisson shared-score component.
+6. Negative Binomial goal model.
+7. Bayesian Gamma–Poisson posterior predictive model.
+8. Skellam goal-difference model.
+9. Elo-style recent-performance rating.
+10. Composite attack/defence Power Index.
+11. Bayesian W/D/L form posterior.
+12. Recency-weighted bootstrap simulation.
+
+BTTS, O/U2.5 and the correct-score matrix are calculated from the ensemble of full score-distribution models. Corners O/U8.5 uses a separate five-model ensemble (Poisson, Negative Binomial, Gamma–Poisson, bootstrap and a pressure-adjusted model).
+""")
+        st.caption("This is a form/performance forecasting system, not a guarantee of match outcome. No bookmaker prices are used by the prediction engine.")
